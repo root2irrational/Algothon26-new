@@ -15,9 +15,22 @@ import pandas as pd
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 
+import argparse
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Hashable
+
+from scipy import stats
 from scipy.cluster.hierarchy import dendrogram, leaves_list, linkage
 from scipy.spatial.distance import squareform
 from scipy.stats import norm
+
+from sklearn.linear_model import LassoCV
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from statsmodels.graphics.tsaplots import plot_acf
 
 DataLike: TypeAlias = pd.Series | pd.DataFrame | np.ndarray
 ReturnMethod: TypeAlias = Literal["simple", "log", "difference"]
@@ -1129,3 +1142,363 @@ def find_mean_reverting_assets(
             ascending=False,
         )
     )
+
+
+def majority_return_forecast(prices, target, plot=True):
+    """
+    Predict the target's return every day using the majority of peer
+    instruments' returns from the previous day.
+
+    Rows must be ordered oldest to newest. A date index is not required.
+    """
+    if target not in prices.columns:
+        raise ValueError(f"{target!r} is not in prices.columns.")
+
+    if len(prices) < 3:
+        raise ValueError("At least three price observations are required.")
+
+    returns = prices.pct_change(fill_method=None)
+    peers = returns.drop(columns=target)
+
+    def majority_prediction(peer_returns):
+        peer_returns = peer_returns.dropna()
+
+        if peer_returns.empty:
+            return np.nan
+
+        positive = peer_returns[peer_returns > 0]
+        negative = peer_returns[peer_returns < 0]
+
+        if len(positive) > len(negative):
+            return positive.median()
+
+        if len(negative) > len(positive):
+            return negative.median()
+
+        return 0.0
+
+    # Prediction made from each day's peer returns.
+    signals = peers.apply(majority_prediction, axis=1)
+
+    # Shift forward: peers on day t predict the target on day t+1.
+    daily_predictions = signals.shift(1)
+
+    results = pd.DataFrame({
+        "prediction": daily_predictions,
+        "actual": returns[target],
+    }).dropna()
+
+    results["predicted_direction"] = np.sign(results["prediction"])
+    results["actual_direction"] = np.sign(results["actual"])
+
+    # Ignore tied votes when evaluating directional accuracy.
+    active = results["predicted_direction"] != 0
+
+    results["correct"] = np.nan
+    results.loc[active, "correct"] = (
+        results.loc[active, "predicted_direction"]
+        == results.loc[active, "actual_direction"]
+    ).astype(float)
+
+    results["strategy_return"] = (
+        results["predicted_direction"] * results["actual"]
+    )
+    results["strategy_growth"] = (
+        1 + results["strategy_return"]
+    ).cumprod()
+    results["target_growth"] = (
+        1 + results["actual"]
+    ).cumprod()
+
+    results["rolling_accuracy"] = (
+        results["correct"]
+        .rolling(20, min_periods=5)
+        .mean()
+    )
+
+    # Latest peers predict the unobserved next day.
+    tomorrow_forecast = signals.iloc[-1]
+
+    directional_accuracy = results["correct"].mean()
+
+    diagnostics = {
+        "tomorrow_forecast": tomorrow_forecast,
+        "tomorrow_direction": np.sign(tomorrow_forecast),
+        "directional_accuracy": directional_accuracy,
+        "correlation": results["prediction"].corr(results["actual"]),
+        "mae": (
+            results["prediction"] - results["actual"]
+        ).abs().mean(),
+        "number_of_predictions": len(results),
+        "results": results,
+    }
+
+    if plot:
+        fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+
+        results[["prediction", "actual"]].plot(
+            ax=axes[0, 0],
+            alpha=0.7,
+        )
+        axes[0, 0].axhline(0, color="grey", linewidth=0.8)
+        axes[0, 0].set_title("Daily predicted vs actual returns")
+        axes[0, 0].set_ylabel("Return")
+
+        results["rolling_accuracy"].plot(
+            ax=axes[0, 1],
+            color="navy",
+        )
+        axes[0, 1].axhline(
+            0.5,
+            color="grey",
+            linestyle="--",
+            label="50% reference",
+        )
+        axes[0, 1].set_ylim(0, 1)
+        axes[0, 1].set_title(
+            f"20-day directional accuracy\n"
+            f"Overall: {directional_accuracy:.2%}"
+        )
+        axes[0, 1].legend()
+
+        results[["strategy_growth", "target_growth"]].plot(
+            ax=axes[1, 0]
+        )
+        axes[1, 0].set_title("Majority strategy vs target")
+        axes[1, 0].set_ylabel("Growth of $1")
+
+        axes[1, 1].scatter(
+            results["prediction"],
+            results["actual"],
+            alpha=0.4,
+        )
+        axes[1, 1].axhline(0, color="grey", linewidth=0.8)
+        axes[1, 1].axvline(0, color="grey", linewidth=0.8)
+        axes[1, 1].set_title(
+            f"Predicted vs actual\n"
+            f"Correlation: {diagnostics['correlation']:.3f}"
+        )
+        axes[1, 1].set_xlabel("Predicted return")
+        axes[1, 1].set_ylabel("Actual return")
+
+        fig.suptitle(
+            f"{target} — tomorrow forecast: "
+            f"{tomorrow_forecast:.3%}"
+        )
+        fig.tight_layout()
+        plt.show()
+
+        diagnostics["figure"] = fig
+
+    return tomorrow_forecast, diagnostics
+
+def adaptive_majority_return_forecast(
+    prices,
+    target,
+    lookback=20,
+    min_history=None,
+    plot=True,
+):
+    """
+    Predict the target's daily return from the previous day's peer returns.
+
+    If the base majority model's trailing directional accuracy is below 50%,
+    invert the prediction. Otherwise, retain the usual prediction.
+
+    Rows must be ordered from oldest to newest.
+    """
+    if target not in prices.columns:
+        raise ValueError(f"{target!r} is not in prices.columns.")
+
+    if lookback < 1:
+        raise ValueError("lookback must be at least 1.")
+
+    if min_history is None:
+        min_history = lookback
+
+    returns = prices.pct_change(fill_method=None)
+    peers = returns.drop(columns=target)
+
+    def majority_prediction(peer_returns):
+        peer_returns = peer_returns.dropna()
+
+        if peer_returns.empty:
+            return np.nan
+
+        positive = peer_returns[peer_returns > 0]
+        negative = peer_returns[peer_returns < 0]
+
+        if len(positive) > len(negative):
+            return float(positive.median())
+
+        if len(negative) > len(positive):
+            return float(negative.median())
+
+        return 0.0
+
+    # Peer returns on row t create the base forecast for row t+1.
+    peer_signals = peers.apply(majority_prediction, axis=1)
+    base_prediction = peer_signals.shift(1)
+
+    results = pd.DataFrame({
+        "actual": returns[target],
+        "base_prediction": base_prediction,
+    }).dropna()
+
+    results["actual_direction"] = np.sign(results["actual"])
+    results["base_direction"] = np.sign(results["base_prediction"])
+
+    # Evaluate the unmodified majority model.
+    results["base_correct"] = np.where(
+        results["base_direction"] != 0,
+        (
+            results["base_direction"]
+            == results["actual_direction"]
+        ).astype(float),
+        np.nan,
+    )
+
+    # Shift by one so today's inversion decision never uses today's outcome.
+    results["prior_base_accuracy"] = (
+        results["base_correct"]
+        .rolling(
+            window=lookback,
+            min_periods=min_history,
+        )
+        .mean()
+        .shift(1)
+    )
+
+    # Use the usual prediction until enough accuracy history exists.
+    results["invert"] = (
+        results["prior_base_accuracy"].notna()
+        & (results["prior_base_accuracy"] < 0.5)
+    )
+
+    results["prediction"] = np.where(
+        results["invert"],
+        -results["base_prediction"],
+        results["base_prediction"],
+    )
+
+    results["predicted_direction"] = np.sign(results["prediction"])
+
+    results["correct"] = np.where(
+        results["predicted_direction"] != 0,
+        (
+            results["predicted_direction"]
+            == results["actual_direction"]
+        ).astype(float),
+        np.nan,
+    )
+
+    results["strategy_return"] = (
+        results["predicted_direction"] * results["actual"]
+    )
+    results["strategy_growth"] = (
+        1 + results["strategy_return"]
+    ).cumprod()
+    results["target_growth"] = (
+        1 + results["actual"]
+    ).cumprod()
+
+    results["rolling_adaptive_accuracy"] = (
+        results["correct"]
+        .rolling(lookback, min_periods=5)
+        .mean()
+    )
+
+    results["rolling_base_accuracy"] = (
+        results["base_correct"]
+        .rolling(lookback, min_periods=5)
+        .mean()
+    )
+
+    # Tomorrow's base forecast comes from the final row of peer returns.
+    tomorrow_base_forecast = peer_signals.iloc[-1]
+
+    # All currently observed outcomes can be used for tomorrow's decision.
+    tomorrow_base_accuracy = (
+        results["base_correct"]
+        .tail(lookback)
+        .mean()
+    )
+
+    enough_history = (
+        results["base_correct"]
+        .tail(lookback)
+        .count()
+        >= min_history
+    )
+
+    invert_tomorrow = (
+        enough_history
+        and tomorrow_base_accuracy < 0.5
+    )
+
+    tomorrow_forecast = (
+        -tomorrow_base_forecast
+        if invert_tomorrow
+        else tomorrow_base_forecast
+    )
+
+    diagnostics = {
+        "tomorrow_forecast": tomorrow_forecast,
+        "tomorrow_base_forecast": tomorrow_base_forecast,
+        "tomorrow_base_accuracy": tomorrow_base_accuracy,
+        "invert_tomorrow": invert_tomorrow,
+        "base_accuracy": results["base_correct"].mean(),
+        "adaptive_accuracy": results["correct"].mean(),
+        "adaptive_mae": (
+            results["prediction"] - results["actual"]
+        ).abs().mean(),
+        "number_inverted": int(results["invert"].sum()),
+        "results": results,
+    }
+
+    if plot:
+        fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+
+        results[
+            ["prediction", "actual"]
+        ].plot(ax=axes[0, 0], alpha=0.7)
+        axes[0, 0].axhline(0, color="grey", linewidth=0.8)
+        axes[0, 0].set_title("Adaptive prediction vs actual")
+
+        results[
+            ["rolling_base_accuracy", "rolling_adaptive_accuracy"]
+        ].plot(ax=axes[0, 1])
+        axes[0, 1].axhline(
+            0.5,
+            color="black",
+            linestyle="--",
+            label="Inversion threshold",
+        )
+        axes[0, 1].set_ylim(0, 1)
+        axes[0, 1].set_title(f"{lookback}-day directional accuracy")
+        axes[0, 1].legend()
+
+        results[
+            ["strategy_growth", "target_growth"]
+        ].plot(ax=axes[1, 0])
+        axes[1, 0].set_title("Adaptive strategy vs target")
+        axes[1, 0].set_ylabel("Growth of $1")
+
+        results["invert"].astype(int).plot(
+            ax=axes[1, 1],
+            color="firebrick",
+        )
+        axes[1, 1].set_yticks([0, 1])
+        axes[1, 1].set_yticklabels(["Usual", "Opposite"])
+        axes[1, 1].set_title("Prediction regime")
+
+        fig.suptitle(
+            f"{target} tomorrow forecast: {tomorrow_forecast:.3%} — "
+            f"{'INVERTED' if invert_tomorrow else 'USUAL'}"
+        )
+        fig.tight_layout()
+        plt.show()
+
+        diagnostics["figure"] = fig
+
+    return tomorrow_forecast, diagnostics

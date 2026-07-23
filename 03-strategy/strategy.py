@@ -2,23 +2,18 @@ import numpy as np
 
 
 N_INST = 51
-
 MAX_POS_ALGO = 100_000
 MAX_POS_ELSE = 10_000
 
-BET_POS_ALGO = 1_000
+# Parameters
+BET_POS_ALGO = 100_000
 BET_POS_ELSE = 10_000
-
-# Pair-strategy parameters
 WINDOW = 40
-Z_THRESHOLD = 0
-
-# Individual return mean-reversion parameters
 WINDOW_INDIVIDUAL = 40
+Z_THRESHOLD = 0
 Z_INDIVIDUAL = 2
 
 currentPos = np.zeros(N_INST, dtype=int)
-
 
 good_pairs = [
     ["AENO", "NWIG"],
@@ -28,9 +23,14 @@ good_pairs = [
     ["EORC", "NGTE"],
     ["NPCK", "SRTX"],
     ["HUXZ", "ACAC"],
+    ["HETT", "ULXY"],
+    ["FWWG", "BLBT"],
+    ["NAYO", "EELT"],
+    ["ALUT", "CCNS"],
+    ["RRES", "CTGI"]
 ]
-
-individual = ["CUBO"]
+# good_pairs = [["FWWG", "BLBT"]]
+individual = []
 
 
 # Must match the row order of prcSoFar exactly.
@@ -44,7 +44,6 @@ INSTRUMENTS = [
     "FARS", "MHRM", "EAFC",
 ]
 
-
 def position_limits(instrument_name):
     """Return bet size and maximum position for an instrument."""
     if instrument_name == "ALGO":
@@ -55,13 +54,10 @@ def position_limits(instrument_name):
 
 def pairs_strategy(prcSoFar, instrument_index):
     """
-    Generate target positions for instruments in good_pairs.
+    Trade residual mean reversion for each pair.
 
-    The strategy fits:
-
-        y = alpha + beta * x + residual
-
-    over WINDOW observations and trades residual mean reversion.
+    Individual dollar exposures are proportional to (1, beta), with the
+    larger leg capped at BET_POS_ELSE or BET_POS_ALGO.
     """
     nins, nt = prcSoFar.shape
     target = np.zeros(nins, dtype=float)
@@ -91,16 +87,22 @@ def pairs_strategy(prcSoFar, instrument_index):
             continue
 
         # Rolling OLS: y = alpha + beta*x + residual.
-        design = np.column_stack(
-            (np.ones(WINDOW), x)
-        )
+        design = np.column_stack((
+            np.ones(WINDOW),
+            x,
+        ))
+
         alpha, beta = np.linalg.lstsq(
             design,
             y,
             rcond=None,
         )[0]
 
+        if not np.isfinite(beta):
+            continue
+
         residuals = y - (alpha + beta * x)
+        residual_mean = residuals.mean()
         residual_std = residuals.std(ddof=2)
 
         if (
@@ -109,41 +111,74 @@ def pairs_strategy(prcSoFar, instrument_index):
         ):
             continue
 
-        z_score = residuals[-1] / residual_std
+        z_score = (
+            residuals[-1] - residual_mean
+        ) / residual_std
 
-        if not np.isfinite(z_score):
+        if (
+            not np.isfinite(z_score)
+            or abs(z_score) < Z_THRESHOLD
+        ):
             continue
 
-        if abs(z_score) < Z_THRESHOLD:
-            continue
-
-        # Positive residual:
-        # y is relatively expensive, so short y and long beta*x.
-        #
-        # Negative residual:
-        # y is relatively cheap, so long y and short beta*x.
+        # Positive residual: short y, take opposite beta-weighted x leg.
+        # Negative residual: long y, take opposite beta-weighted x leg.
         y_direction = -np.sign(z_score)
 
         if "ALGO" in (y_name, x_name):
-            bet_size = BET_POS_ALGO
+            max_exposure = BET_POS_ALGO
             max_position = MAX_POS_ALGO
         else:
-            bet_size = BET_POS_ELSE
+            max_exposure = BET_POS_ELSE
             max_position = MAX_POS_ELSE
 
-        y_position = y_direction * bet_size / y[-1]
-        x_position = -y_direction * beta * bet_size / x[-1]
+        # Raw dollar exposure weights are:
+        #
+        #     y:  1
+        #     x: -beta
+        #
+        # Normalize so the largest individual dollar exposure is exactly
+        # max_exposure.
+        exposure_scale = max(1.0, abs(beta))
 
-        target[y_idx] += np.clip(
-            y_position,
-            -max_position,
-            max_position,
+        y_dollar_exposure = (
+            y_direction
+            * max_exposure
+            / exposure_scale
         )
-        target[x_idx] += np.clip(
-            x_position,
-            -max_position,
-            max_position,
+
+        x_dollar_exposure = (
+            -y_direction
+            * beta
+            * max_exposure
+            / exposure_scale
         )
+
+        # Convert dollar exposures into instrument quantities.
+        y_position = y_dollar_exposure / y[-1]
+        x_position = x_dollar_exposure / x[-1]
+
+        # If a quantity limit is reached, scale both legs together so the
+        # beta relationship remains unchanged.
+        position_scale = 1.0
+
+        if abs(y_position) > max_position:
+            position_scale = min(
+                position_scale,
+                max_position / abs(y_position),
+            )
+
+        if abs(x_position) > max_position:
+            position_scale = min(
+                position_scale,
+                max_position / abs(x_position),
+            )
+
+        y_position *= position_scale
+        x_position *= position_scale
+
+        target[y_idx] += y_position
+        target[x_idx] += x_position
 
     return target
 
