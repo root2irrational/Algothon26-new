@@ -15,6 +15,10 @@ import pandas as pd
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 
+from scipy.cluster.hierarchy import dendrogram, leaves_list, linkage
+from scipy.spatial.distance import squareform
+from scipy.stats import norm
+
 DataLike: TypeAlias = pd.Series | pd.DataFrame | np.ndarray
 ReturnMethod: TypeAlias = Literal["simple", "log", "difference"]
 
@@ -261,86 +265,335 @@ def plot_series(
     *,
     normalize: bool = False,
     log_scale: bool = False,
+    subplots: bool = False,
+    n_cols: int = 4,
     title: str | None = None,
     ax: Axes | None = None,
-) -> tuple[Figure, Axes]:
-    """Plot one or more time series on a shared axis."""
+) -> tuple[Figure, Axes | np.ndarray]:
+    """Plot time series together or in a compact grid of subplots."""
     frame = _as_frame(data)
+
     if normalize:
-        first = frame.apply(lambda column: column.dropna().iloc[0] if column.notna().any() else np.nan)
+        first = frame.apply(
+            lambda column: (
+                column.dropna().iloc[0]
+                if column.notna().any()
+                else np.nan
+            )
+        )
         if (first == 0).any():
-            raise ValueError("cannot normalize a series whose first valid value is zero")
+            raise ValueError(
+                "cannot normalize a series whose first valid value is zero"
+            )
         frame = frame.divide(first).multiply(100)
+
+    ylabel = "Normalized value (base 100)" if normalize else "Value"
+    yscale = "log" if log_scale else "linear"
+
+    if subplots:
+        if ax is not None:
+            raise ValueError("ax cannot be supplied when subplots=True")
+
+        n_cols = _positive_int(n_cols, name="n_cols")
+        n_instruments = frame.shape[1]
+        n_cols = min(n_cols, n_instruments)
+        n_rows = int(np.ceil(n_instruments / n_cols))
+
+        fig, axes = plt.subplots(
+            n_rows,
+            n_cols,
+            figsize=(4 * n_cols, 3.5 * n_rows),
+            sharex=True,
+            squeeze=False,
+        )
+        flat_axes = axes.ravel()
+
+        for axis, column in zip(flat_axes, frame.columns):
+            frame[column].plot(
+                ax=axis,
+                legend=False,
+                linewidth=1.2,
+            )
+            axis.set_title(str(column))
+            axis.set_xlabel("Observation")
+            axis.set_ylabel(ylabel)
+            axis.set_yscale(yscale)
+            axis.grid(alpha=0.25)
+
+        # Hide unused panels in the final row.
+        for axis in flat_axes[n_instruments:]:
+            axis.set_visible(False)
+
+        fig.suptitle(title or "Time Series", y=1.01)
+        fig.tight_layout()
+        return fig, axes
 
     if ax is None:
         fig, ax = plt.subplots(figsize=(11, 5))
     else:
         fig = ax.figure
+
     frame.plot(ax=ax)
     ax.set_title(title or "Time Series")
     ax.set_xlabel("Observation")
-    ax.set_ylabel("Normalized value (base 100)" if normalize else "Value")
-    ax.set_yscale("log" if log_scale else "linear")
+    ax.set_ylabel(ylabel)
+    ax.set_yscale(yscale)
     ax.grid(alpha=0.25)
+
     fig.tight_layout()
     return fig, ax
-
 
 def plot_series_indicators(
     prices: DataLike,
     *,
-    ema_windows: Sequence[int] = (10, 30),
-    volatility_window: int = 20,
+    ema_windows: Sequence[int] | None = (10, 30),
+    volatility_window: int | None = 20,
     sharpe_window: int | None = 60,
     annualization: int = 250,
     normalize: bool = False,
+    n_cols: int = 4,
     title: str | None = None,
 ) -> tuple[Figure, np.ndarray]:
-    """Plot prices, EMAs, rolling volatility, and optionally rolling Sharpe."""
+    """
+    Plot each instrument and its selected indicators in a compact grid.
+
+    Pass None to exclude a feature:
+      - ema_windows=None
+      - volatility_window=None
+      - sharpe_window=None
+
+    The returned axes array has shape:
+        (instrument_rows, n_cols, panels_per_instrument)
+    """
     frame = _as_frame(prices, name="price")
-    windows = [_positive_int(window, name="ema_window") for window in ema_windows]
-    volatility_window = _positive_int(volatility_window, name="volatility_window")
+
+    annualization = _positive_int(
+        annualization,
+        name="annualization",
+    )
+    n_cols = _positive_int(
+        n_cols,
+        name="n_cols",
+    )
+
+    windows = (
+        [
+            _positive_int(window, name="ema_window")
+            for window in ema_windows
+        ]
+        if ema_windows is not None
+        else []
+    )
+
+    if volatility_window is not None:
+        volatility_window = _positive_int(
+            volatility_window,
+            name="volatility_window",
+        )
+
     if sharpe_window is not None:
-        sharpe_window = _positive_int(sharpe_window, name="sharpe_window")
+        sharpe_window = _positive_int(
+            sharpe_window,
+            name="sharpe_window",
+        )
 
     display = frame.copy()
+
     if normalize:
-        first = display.apply(lambda column: column.dropna().iloc[0] if column.notna().any() else np.nan)
+        first = display.apply(
+            lambda column: (
+                column.dropna().iloc[0]
+                if column.notna().any()
+                else np.nan
+            )
+        )
+
         if (first == 0).any():
-            raise ValueError("cannot normalize a series whose first valid value is zero")
+            raise ValueError(
+                "cannot normalize a series whose first valid value is zero"
+            )
+
         display = display.divide(first).multiply(100)
 
-    panel_count = 3 if sharpe_window is not None else 2
-    fig, axes = plt.subplots(panel_count, 1, figsize=(12, 3.3 * panel_count), sharex=True)
-    axes = np.atleast_1d(axes)
-    display.plot(ax=axes[0], linewidth=1.5)
-    for column in display:
-        for window in windows:
-            axes[0].plot(
-                display.index,
-                display[column].ewm(span=window, adjust=False, min_periods=window).mean(),
-                label=f"{column} EMA {window}",
-                alpha=0.75,
-            )
-    axes[0].set_title(title or "Prices and indicators")
-    axes[0].set_ylabel("Normalized price" if normalize else "Price")
-    axes[0].legend(ncol=2, fontsize="small")
+    # Calculate returns only if a return-based indicator is enabled.
+    returns = None
 
-    returns = _as_frame(calculate_returns(frame), name="return")
-    stats = rolling_statistics(returns, window=volatility_window, annualization=annualization)
-    (stats["volatility"] * np.sqrt(annualization)).plot(ax=axes[1])
-    axes[1].set_ylabel("Annualized volatility")
+    if volatility_window is not None or sharpe_window is not None:
+        returns = _as_frame(
+            calculate_returns(frame),
+            name="return",
+        )
+
+    volatility = None
+
+    if volatility_window is not None:
+        volatility = (
+            rolling_statistics(
+                returns,
+                window=volatility_window,
+                annualization=annualization,
+            )["volatility"]
+            * np.sqrt(annualization)
+        )
+
+    sharpe = None
 
     if sharpe_window is not None:
-        sharpe = rolling_statistics(returns, window=sharpe_window, annualization=annualization)["sharpe"]
-        sharpe.plot(ax=axes[2])
-        axes[2].axhline(0, color="black", linewidth=0.8, alpha=0.5)
-        axes[2].set_ylabel("Rolling Sharpe")
+        sharpe = rolling_statistics(
+            returns,
+            window=sharpe_window,
+            annualization=annualization,
+        )["sharpe"]
 
-    for axis in axes:
-        axis.grid(alpha=0.25)
-    axes[-1].set_xlabel("Observation")
-    fig.tight_layout()
+    enabled_panels = ["price"]
+
+    if volatility is not None:
+        enabled_panels.append("volatility")
+
+    if sharpe is not None:
+        enabled_panels.append("sharpe")
+
+    panel_count = len(enabled_panels)
+    n_instruments = frame.shape[1]
+    n_cols = min(n_cols, n_instruments)
+    instrument_rows = int(np.ceil(n_instruments / n_cols))
+    figure_rows = instrument_rows * panel_count
+
+    fig, raw_axes = plt.subplots(
+        figure_rows,
+        n_cols,
+        figsize=(4.5 * n_cols, 2.5 * figure_rows),
+        squeeze=False,
+    )
+
+    # Reorganize axes as:
+    # axes[instrument_row, instrument_column, indicator_panel]
+    axes = np.empty(
+        (instrument_rows, n_cols, panel_count),
+        dtype=object,
+    )
+
+    for instrument_row in range(instrument_rows):
+        for instrument_col in range(n_cols):
+            for panel_index in range(panel_count):
+                axes[
+                    instrument_row,
+                    instrument_col,
+                    panel_index,
+                ] = raw_axes[
+                    instrument_row * panel_count + panel_index,
+                    instrument_col,
+                ]
+
+    for instrument_position, column in enumerate(frame.columns):
+        instrument_row, instrument_col = divmod(
+            instrument_position,
+            n_cols,
+        )
+
+        instrument_axes = axes[
+            instrument_row,
+            instrument_col,
+        ]
+
+        panel_index = 0
+
+        # Price and optional EMAs
+        price_axis = instrument_axes[panel_index]
+        panel_index += 1
+
+        price_axis.plot(
+            display.index,
+            display[column],
+            label=str(column),
+            linewidth=1.5,
+        )
+
+        for window in windows:
+            ema = display[column].ewm(
+                span=window,
+                adjust=False,
+                min_periods=window,
+            ).mean()
+
+            price_axis.plot(
+                display.index,
+                ema,
+                label=f"EMA {window}",
+                alpha=0.75,
+            )
+
+        price_axis.set_title(str(column))
+        price_axis.set_ylabel(
+            "Normalized price" if normalize else "Price"
+        )
+        price_axis.grid(alpha=0.25)
+
+        if windows:
+            price_axis.legend(fontsize="x-small")
+
+        # Optional rolling volatility
+        if volatility is not None:
+            volatility_axis = instrument_axes[panel_index]
+            panel_index += 1
+
+            volatility_axis.plot(
+                volatility.index,
+                volatility[column],
+                linewidth=1.2,
+            )
+            volatility_axis.set_ylabel("Ann. volatility")
+            volatility_axis.grid(alpha=0.25)
+
+        # Optional rolling Sharpe
+        if sharpe is not None:
+            sharpe_axis = instrument_axes[panel_index]
+            panel_index += 1
+
+            sharpe_axis.plot(
+                sharpe.index,
+                sharpe[column],
+                linewidth=1.2,
+            )
+            sharpe_axis.axhline(
+                0,
+                color="black",
+                linewidth=0.8,
+                alpha=0.5,
+            )
+            sharpe_axis.set_ylabel("Rolling Sharpe")
+            sharpe_axis.grid(alpha=0.25)
+
+        # Align x-axes within each instrument group.
+        for axis in instrument_axes[1:]:
+            axis.sharex(price_axis)
+
+        for axis in instrument_axes[:-1]:
+            axis.tick_params(labelbottom=False)
+
+        instrument_axes[-1].set_xlabel("Observation")
+
+    # Hide unused instrument positions in the final row.
+    total_positions = instrument_rows * n_cols
+
+    for instrument_position in range(
+        n_instruments,
+        total_positions,
+    ):
+        instrument_row, instrument_col = divmod(
+            instrument_position,
+            n_cols,
+        )
+
+        for axis in axes[instrument_row, instrument_col]:
+            axis.set_visible(False)
+
+    fig.suptitle(
+        title or "Prices and indicators",
+        fontsize=14,
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.98))
+
     return fig, axes
 
 
@@ -387,3 +640,492 @@ __all__ = [
     "select_instruments",
     "summary_statistics",
 ]
+
+def pair_instruments(
+    prices: pd.DataFrame,
+    *,
+    correlation_weight: float = 0.7,
+    volatility_weight: float = 0.3,
+    correlation_method: Literal["pearson", "spearman"] = "pearson",
+    linkage_method: Literal["single", "complete", "average"] = "average",
+    ax: Axes | None = None,
+) -> list[tuple[object, object]]:
+    """Plot a dendrogram and return disjoint pairs with minimum mixed distance."""
+    if prices.shape[1] < 2:
+        raise ValueError("prices must contain at least two instruments")
+    if not prices.columns.is_unique:
+        raise ValueError("instrument names must be unique")
+
+    weights = np.asarray(
+        [correlation_weight, volatility_weight],
+        dtype=float,
+    )
+    if not np.isfinite(weights).all() or (weights < 0).any() or weights.sum() == 0:
+        raise ValueError("weights must be finite, non-negative, and not both zero")
+    weights /= weights.sum()
+
+    returns = (
+        prices.astype(float)
+        .pct_change(fill_method=None)
+        .dropna(how="any")
+    )
+    if len(returns) < 2:
+        raise ValueError("insufficient complete return observations")
+
+    correlation = returns.corr(method=correlation_method).to_numpy()
+    volatility = returns.std(ddof=1).to_numpy()
+
+    if not np.isfinite(correlation).all():
+        raise ValueError("correlation contains invalid values")
+    if not np.isfinite(volatility).all() or (volatility <= 0).any():
+        raise ValueError("each instrument must have positive finite volatility")
+
+    # High positive correlation produces a small distance.
+    correlation_distance = np.sqrt(
+        np.clip((1.0 - correlation) / 2.0, 0.0, 1.0)
+    )
+
+    # Instruments with similar proportional volatility have a small distance.
+    log_volatility = np.log(volatility)
+    volatility_distance = np.abs(
+        log_volatility[:, None] - log_volatility[None, :]
+    )
+    if (scale := volatility_distance.max()) > 0:
+        volatility_distance /= scale
+
+    distance = (
+        weights[0] * correlation_distance
+        + weights[1] * volatility_distance
+    )
+    distance = (distance + distance.T) / 2.0
+    np.fill_diagonal(distance, 0.0)
+
+    # Dendrogram visualization.
+    tree = linkage(
+        squareform(distance, checks=True),
+        method=linkage_method,
+        optimal_ordering=True,
+    )
+
+    if ax is None:
+        _, ax = plt.subplots(figsize=(12, 6))
+
+    dendrogram(
+        tree,
+        labels=[str(column) for column in prices.columns],
+        leaf_rotation=90,
+        leaf_font_size=9,
+        ax=ax,
+    )
+    ax.set_title("Instrument Clusters")
+    ax.set_xlabel("Instrument")
+    ax.set_ylabel("Combined distance")
+    ax.grid(axis="y", alpha=0.25)
+    ax.figure.tight_layout()
+
+    # Select closest available pairs from the actual distance matrix.
+    candidates = sorted(
+        (
+            (distance[i, j], i, j)
+            for i in range(prices.shape[1])
+            for j in range(i + 1, prices.shape[1])
+        ),
+        key=lambda candidate: candidate[0],
+    )
+
+    pairs: list[tuple[object, object]] = []
+    used: set[int] = set()
+
+    for _, first, second in candidates:
+        if first not in used and second not in used:
+            pairs.append(
+                (prices.columns[first], prices.columns[second])
+            )
+            used.update((first, second))
+
+    return pairs
+
+def plot_instrument_pairs(
+    prices: pd.DataFrame,
+    pairs: Sequence[tuple[str, str]],
+    *,
+    columns: int = 3,
+    normalize: bool = True,
+    figsize_per_plot: tuple[float, float] = (5.0, 3.5),
+) -> tuple[Figure, np.ndarray]:
+    """Plot each instrument pair in a separate subplot."""
+    if not pairs:
+        raise ValueError("pairs must not be empty")
+    if columns < 1:
+        raise ValueError("columns must be positive")
+
+    missing = {
+        instrument
+        for pair in pairs
+        for instrument in pair
+        if instrument not in prices.columns
+    }
+    if missing:
+        raise KeyError(f"unknown instruments: {sorted(missing)}")
+
+    columns = min(columns, len(pairs))
+    rows = int(np.ceil(len(pairs) / columns))
+
+    figure, axes = plt.subplots(
+        rows,
+        columns,
+        figsize=(figsize_per_plot[0] * columns, figsize_per_plot[1] * rows),
+        squeeze=False,
+        sharex=True,
+    )
+
+    for axis, (first, second) in zip(axes.flat, pairs):
+        pair_prices = prices.loc[:, [first, second]].astype(float)
+
+        if normalize:
+            initial = pair_prices.apply(lambda series: series.dropna().iloc[0])
+            if (initial == 0).any():
+                raise ValueError(f"cannot normalize pair {(first, second)}")
+            pair_prices = pair_prices.divide(initial).multiply(100)
+
+        pair_prices.plot(ax=axis, linewidth=1.3)
+        axis.set_title(f"{first} vs {second}")
+        axis.set_xlabel("Observation")
+        axis.set_ylabel("Normalized price" if normalize else "Price")
+        axis.grid(alpha=0.25)
+        axis.legend()
+
+    for axis in axes.flat[len(pairs):]:
+        axis.set_visible(False)
+
+    figure.tight_layout()
+    return figure, axes
+
+def plot_rolling_spreads(
+    prices: pd.DataFrame,
+    pairs: Sequence[tuple[object, object]],
+    *,
+    rolling_window: int = 60,
+    columns: int = 3,
+) -> tuple[pd.DataFrame, Figure, np.ndarray]:
+    """
+    Plot rolling OLS residuals for instrument pairs.
+
+    For each pair (y, x), estimates:
+        y_t = alpha_t + beta_t * x_t + residual_t
+
+    Coefficients are shifted by one observation to avoid look-ahead bias.
+    """
+    if rolling_window < 2:
+        raise ValueError("rolling_window must be at least 2")
+    if not pairs:
+        raise ValueError("pairs must not be empty")
+
+    missing = {
+        instrument
+        for pair in pairs
+        for instrument in pair
+        if instrument not in prices.columns
+    }
+    if missing:
+        raise KeyError(f"unknown instruments: {sorted(missing, key=str)}")
+
+    columns = min(columns, len(pairs))
+    rows = int(np.ceil(len(pairs) / columns))
+
+    figure, axes = plt.subplots(
+        rows,
+        columns,
+        figsize=(5 * columns, 3.5 * rows),
+        squeeze=False,
+        sharex=True,
+    )
+
+    spreads: dict[tuple[object, object], pd.Series] = {}
+
+    for axis, (y_name, x_name) in zip(axes.flat, pairs):
+        pair = prices.loc[:, [y_name, x_name]].astype(float)
+        y, x = pair[y_name], pair[x_name]
+
+        rolling = x.rolling(rolling_window, min_periods=rolling_window)
+        beta = (
+            y.rolling(rolling_window, min_periods=rolling_window).cov(x)
+            / rolling.var()
+        )
+        alpha = (
+            y.rolling(rolling_window, min_periods=rolling_window).mean()
+            - beta * rolling.mean()
+        )
+
+        # Use only coefficients known before the current observation.
+        spread = y - alpha.shift(1) - beta.shift(1) * x
+        spreads[(y_name, x_name)] = spread
+
+        axis.plot(spread.index, spread, linewidth=1)
+        axis.axhline(0, color="black", linestyle="--", linewidth=0.8)
+        axis.set_title(f"{y_name} − β·{x_name}")
+        axis.set_ylabel("OLS residual")
+        axis.grid(alpha=0.25)
+
+    for axis in axes.flat[len(pairs):]:
+        axis.set_visible(False)
+
+    figure.tight_layout()
+
+    residuals = pd.concat(spreads, axis=1)
+    residuals.columns = pd.MultiIndex.from_tuples(
+        residuals.columns,
+        names=["dependent", "independent"],
+    )
+
+    return residuals, figure, axes
+
+def plot_residual_distributions(
+    residuals: pd.DataFrame,
+    *,
+    bins: int = 30,
+    columns: int = 3,
+) -> tuple[pd.DataFrame, Figure, np.ndarray]:
+    """Fit and plot a normal distribution for each residual series."""
+    if residuals.empty:
+        raise ValueError("residuals must not be empty")
+    if bins < 2 or columns < 1:
+        raise ValueError("bins must be at least 2 and columns must be positive")
+
+    columns = min(columns, residuals.shape[1])
+    rows = int(np.ceil(residuals.shape[1] / columns))
+
+    figure, axes = plt.subplots(
+        rows,
+        columns,
+        figsize=(5 * columns, 3.5 * rows),
+        squeeze=False,
+    )
+
+    fitted_parameters = []
+
+    for axis, name in zip(axes.flat, residuals.columns):
+        values = residuals[name].to_numpy(dtype=float)
+        values = values[np.isfinite(values)]
+
+        if values.size < 2 or np.std(values) == 0:
+            raise ValueError(f"insufficient variation in residuals for {name}")
+
+        mean, standard_deviation = norm.fit(values)
+
+        lower, upper = values.min(), values.max()
+        x = np.linspace(lower, upper, 300)
+        fitted_density = norm.pdf(
+            x,
+            loc=mean,
+            scale=standard_deviation,
+        )
+
+        axis.hist(
+            values,
+            bins=bins,
+            density=True,
+            alpha=0.6,
+            color="steelblue",
+            label="Residuals",
+        )
+        axis.plot(
+            x,
+            fitted_density,
+            color="darkred",
+            linewidth=2,
+            label="Fitted normal",
+        )
+        axis.axvline(mean, color="black", linestyle="--", linewidth=1)
+        axis.set_title(f"{name}\nμ={mean:.4f}, σ={standard_deviation:.4f}")
+        axis.set_xlabel("Residual")
+        axis.set_ylabel("Density")
+        axis.grid(alpha=0.2)
+        axis.legend()
+
+        fitted_parameters.append(
+            {
+                "pair": name,
+                "mean": mean,
+                "standard_deviation": standard_deviation,
+                "observations": values.size,
+            }
+        )
+
+    for axis in axes.flat[residuals.shape[1]:]:
+        axis.set_visible(False)
+
+    figure.tight_layout()
+
+    fits = pd.DataFrame(fitted_parameters).set_index("pair")
+    return fits, figure, axes
+
+
+def find_mean_reverting_assets(
+    prices: pd.DataFrame,
+    *,
+    window: int = 40,
+    threshold: float = 2.0,
+    min_signals: int = 10,
+) -> pd.DataFrame:
+    """
+    Find assets exhibiting one-day return mean reversion.
+
+    A signal occurs when today's return is at least `threshold`
+    rolling standard deviations from its rolling mean.
+
+    Mean reversion is considered successful when:
+        positive deviation today -> negative return tomorrow
+        negative deviation today -> positive return tomorrow
+
+    Parameters
+    ----------
+    prices:
+        DataFrame with dates as rows and asset names as columns.
+    window:
+        Number of prior returns used to estimate mean and volatility.
+    threshold:
+        Absolute z-score needed to generate a signal.
+    min_signals:
+        Minimum number of signals required for an asset to qualify.
+
+    Returns
+    -------
+    pd.DataFrame
+        Assets ranked by mean-reversion hit rate.
+    """
+    if not isinstance(prices, pd.DataFrame):
+        raise TypeError("prices must be a pandas DataFrame")
+
+    if window < 2:
+        raise ValueError("window must be at least 2")
+
+    if threshold <= 0:
+        raise ValueError("threshold must be positive")
+
+    if min_signals < 1:
+        raise ValueError("min_signals must be positive")
+
+    prices = prices.astype(float)
+
+    if (prices <= 0).any().any():
+        raise ValueError("prices must be strictly positive")
+
+    returns = prices.pct_change(fill_method=None)
+
+    # Shift by one so today's return is not included in the
+    # distribution against which it is being tested.
+    rolling_mean = returns.rolling(
+        window=window,
+        min_periods=window,
+    ).mean().shift(1)
+
+    rolling_std = returns.rolling(
+        window=window,
+        min_periods=window,
+    ).std(ddof=1).shift(1)
+
+    z_scores = (
+        returns - rolling_mean
+    ) / rolling_std.replace(0, np.nan)
+
+    # Tomorrow's return, aligned with today's signal.
+    next_returns = returns.shift(-1)
+
+    results = []
+
+    for asset in prices.columns:
+        asset_z = z_scores[asset]
+        asset_next_return = next_returns[asset]
+
+        signal_mask = (
+            asset_z.abs() >= threshold
+        ) & asset_next_return.notna()
+
+        signal_z = asset_z[signal_mask]
+        following_returns = asset_next_return[signal_mask]
+
+        signal_count = int(signal_mask.sum())
+
+        if signal_count < min_signals:
+            continue
+
+        # Contrarian position:
+        # positive z -> short
+        # negative z -> long
+        direction = -np.sign(signal_z)
+
+        strategy_returns = direction * following_returns
+
+        # Success means that tomorrow's raw return has the
+        # opposite sign to today's deviation.
+        successful_reversals = (
+            np.sign(following_returns)
+            == direction
+        )
+
+        hit_rate = successful_reversals.mean()
+        average_strategy_return = strategy_returns.mean()
+        strategy_volatility = strategy_returns.std(ddof=1)
+
+        if (
+            np.isfinite(strategy_volatility)
+            and strategy_volatility > np.finfo(float).eps
+        ):
+            t_statistic = (
+                average_strategy_return
+                / strategy_volatility
+                * np.sqrt(signal_count)
+            )
+        else:
+            t_statistic = np.nan
+
+        positive_signals = signal_z > 0
+        negative_signals = signal_z < 0
+
+        positive_hit_rate = (
+            (following_returns[positive_signals] < 0).mean()
+            if positive_signals.any()
+            else np.nan
+        )
+
+        negative_hit_rate = (
+            (following_returns[negative_signals] > 0).mean()
+            if negative_signals.any()
+            else np.nan
+        )
+
+        results.append(
+            {
+                "asset": asset,
+                "signals": signal_count,
+                "hit_rate": hit_rate,
+                "positive_deviation_hit_rate": positive_hit_rate,
+                "negative_deviation_hit_rate": negative_hit_rate,
+                "average_next_day_profit": average_strategy_return,
+                "median_next_day_profit": strategy_returns.median(),
+                "t_statistic": t_statistic,
+            }
+        )
+
+    if not results:
+        return pd.DataFrame(
+            columns=[
+                "signals",
+                "hit_rate",
+                "positive_deviation_hit_rate",
+                "negative_deviation_hit_rate",
+                "average_next_day_profit",
+                "median_next_day_profit",
+                "t_statistic",
+            ]
+        )
+
+    return (
+        pd.DataFrame(results)
+        .set_index("asset")
+        .sort_values(
+            ["hit_rate", "average_next_day_profit"],
+            ascending=False,
+        )
+    )
